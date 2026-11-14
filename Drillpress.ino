@@ -56,13 +56,18 @@ int line2Metric = 0; // 0 = Voltage, 1 = Power, 2 = Measured RPM (U)
 
 // Manual Target RPM override per mode
 int manualDrillRPM = 1000;
-int manualChampferRPM = 800;
-int manualTappRPM = 1200;
+int manualChampferRPM = 400;
+int manualTappRPM = 120;
 
 // Motor Run State Toggle & Tapping States
 bool motorRunning = false;
-enum TappingState { TAPP_IDLE, TAPP_FWD, TAPP_WAIT_1, TAPP_REV_DIR, TAPP_BWD, TAPP_WAIT_2, TAPP_OIL, TAPP_MANUAL_REV, TAPP_PAUSED };
-TappingState tappState = TAPP_IDLE;
+enum TappingWorkflowState { TAPP_IDLE, TAPP_AUTO_RUNNING, TAPP_PAUSED_INSPECT, TAPP_RETRACTING };
+TappingWorkflowState tappState = TAPP_IDLE;
+
+// Internal automatic tapping sub-sequence states
+enum TappingSubState { SUB_FWD, SUB_WAIT_1, SUB_REV_DIR, SUB_BWD, SUB_WAIT_2, SUB_OIL };
+TappingSubState tappSubState = SUB_FWD;
+
 unsigned long tappStateTimer = 0;
 int tappPulseTarget = 0;
 int tappPulseStartCount = 0;
@@ -115,16 +120,8 @@ void setup() {
 }
 
 void loop() {
-  // 1. Read Keypad & Serial Override & Handle Navigation / Mode Switching
+  // 1. Read Keypad & Handle Navigation / Mode Switching
   KeyState key = readKeypad();
-  if (Serial.available() > 0) {
-    char sChar = Serial.read();
-    if (sChar == 'S' || sChar == 's') key = KEY_SELECT;
-    else if (sChar == 'L' || sChar == 'l') key = KEY_LEFT;
-    else if (sChar == 'R' || sChar == 'r') key = KEY_RIGHT;
-    else if (sChar == 'U' || sChar == 'u') key = KEY_UP;
-    else if (sChar == 'D' || sChar == 'd') key = KEY_DOWN;
-  }
   handleKeypadInput(key);
 
   // 2. Read Sensors every 500ms with EMA smoothing
@@ -140,25 +137,50 @@ void loop() {
   spindleRPM = getSpindleRPM();
   int btnAction = checkButton();
 
-  // Handle Button Actions
+  // Handle Button Actions (Start/Stop/Tapping Workflow)
   if (btnAction == 1) { // Short Press
     if (currentMode == MODE_TAPP) {
-      if (tappState == TAPP_PAUSED) {
-        tappState = TAPP_MANUAL_REV; 
-      } else if (tappState == TAPP_MANUAL_REV) {
-        tappState = TAPP_PAUSED;
+      if (tappState == TAPP_IDLE) {
+        // Step 1: Start tapping procedure
+        tappState = TAPP_AUTO_RUNNING;
+        tappSubState = SUB_FWD;
+        motorRunning = true;
+        digitalWrite(LED_Pin, HIGH);
+      } 
+      else if (tappState == TAPP_AUTO_RUNNING) {
+        // Step 2: Pause to inspect thread
+        tappState = TAPP_PAUSED_INSPECT;
         motorRunning = false;
-      } else {
-        tappState = TAPP_PAUSED;
+        setSpeed(0, spindleRPM, false);
+      } 
+      else if (tappState == TAPP_PAUSED_INSPECT) {
+        // Step 3: Happy with thread -> Retract backwards
+        tappState = TAPP_RETRACTING;
+        motorRunning = true;
+      } 
+      else if (tappState == TAPP_RETRACTING) {
+        // Step 4: Retraction finished -> Stop whole tapping procedure (LED off)
+        tappState = TAPP_IDLE;
         motorRunning = false;
+        digitalWrite(LED_Pin, LOW);
+        setSpeed(0, spindleRPM, false);
+        pinMode(Direction_Pin, INPUT);
       }
     } else {
+      // Standard Drill / Chamfer Start/Stop
       motorRunning = !motorRunning;
+      digitalWrite(LED_Pin, motorRunning ? HIGH : LOW);
+      if (!motorRunning) {
+        setSpeed(0, spindleRPM, false);
+      }
     }
-  } else if (btnAction == 2) { // Long Press (> 1s)
-    if (currentMode == MODE_TAPP) {
-      tappState = TAPP_FWD; 
+  } 
+  else if (btnAction == 2) { // Long Press (> 1s)
+    if (currentMode == MODE_TAPP && tappState == TAPP_PAUSED_INSPECT) {
+      // If NOT happy with thread -> Resume automatic tapping
+      tappState = TAPP_AUTO_RUNNING;
       motorRunning = true;
+      digitalWrite(LED_Pin, HIGH);
     }
   }
 
@@ -199,17 +221,10 @@ int safeAnalogRead(uint8_t pin) {
 }
 
 /* =========================================================================
-   1. KEYPAD READER & NAVIGATION HANDLER + DIAGNOSTICS
+   1. KEYPAD READER & NAVIGATION HANDLER
    ========================================================================= */
 KeyState readKeypad() {
   int rawVal = safeAnalogRead(Keypad_Pin);
-
-  // Diagnostic print for keypad debugging via Serial Monitor
-  static unsigned long lastKeyDebug = 0;
-  if (millis() - lastKeyDebug > 500) {
-    lastKeyDebug = millis();
-    Serial.print(F("Keypad Raw ADC: ")); Serial.println(rawVal);
-  }
 
   KeyState currentKey = KEY_NONE;
   if (rawVal >= 800)                     currentKey = KEY_NONE;   // Idle / None (~1023)
@@ -235,12 +250,14 @@ void handleKeypadInput(KeyState key) {
     } else if (currentMode == MODE_CHAMPFER) {
       currentMode = MODE_TAPP;
       sizeIndex = 3; 
-      tappState = TAPP_FWD;
-      motorRunning = true;
+      tappState = TAPP_IDLE;
+      motorRunning = false;
+      digitalWrite(LED_Pin, LOW);
     } else {
       currentMode = MODE_DRILL;
       sizeIndex = 3;
       motorRunning = false;
+      digitalWrite(LED_Pin, LOW);
     }
   }
   else if (key == KEY_LEFT) {
@@ -256,11 +273,9 @@ void handleKeypadInput(KeyState key) {
       } else {
         if (sizeIndex < numDrillSizes - 1) sizeIndex++;
       }
-      // Auto-update manual RPM defaults when size changes
       if (currentMode == MODE_DRILL) manualDrillRPM = (int)calculateOptimalRPM(currentMode, drillSizes[sizeIndex]);
       else if (currentMode == MODE_CHAMPFER) manualChampferRPM = (int)calculateOptimalRPM(currentMode, drillSizes[sizeIndex]);
     } else if (activeFocus == 1) {
-      // Adjust Target RPM
       if (currentMode == MODE_DRILL) manualDrillRPM += 25;
       else if (currentMode == MODE_CHAMPFER) manualChampferRPM += 25;
       else manualTappRPM += 10;
@@ -276,7 +291,6 @@ void handleKeypadInput(KeyState key) {
       if (currentMode == MODE_DRILL) manualDrillRPM = (int)calculateOptimalRPM(currentMode, drillSizes[sizeIndex]);
       else if (currentMode == MODE_CHAMPFER) manualChampferRPM = (int)calculateOptimalRPM(currentMode, drillSizes[sizeIndex]);
     } else if (activeFocus == 1) {
-      // Adjust Target RPM downwards
       if (currentMode == MODE_DRILL) manualDrillRPM = max(10, manualDrillRPM - 25);
       else if (currentMode == MODE_CHAMPFER) manualChampferRPM = max(10, manualChampferRPM - 25);
       else manualTappRPM = max(10, manualTappRPM - 10);
@@ -375,7 +389,7 @@ float calculateOptimalRPM(OperationMode mode, int diameterMM) {
   if (mode == MODE_TAPP) {
     return 120.0; 
   }
-  float vc = 25.0; // HSS Co5 optimal cutting speed
+  float vc = (mode == MODE_DRILL) ? 25.0 : 10.0; 
   return (vc * 1000.0) / (3.14159 * (float)diameterMM);
 }
 
@@ -409,72 +423,72 @@ void setSpeed(float targetRPM, float currentRPM, bool enabled) {
    5. TAPPING STATE MACHINE
    ========================================================================= */
 void runTappingStateMachine() {
-  if (tappState == TAPP_PAUSED) {
+  if (tappState == TAPP_IDLE || tappState == TAPP_PAUSED_INSPECT) {
     setSpeed(0, spindleRPM, false);
     pinMode(Direction_Pin, INPUT); 
     return;
   }
 
-  if (tappState == TAPP_MANUAL_REV) {
+  if (tappState == TAPP_RETRACTING) {
     pinMode(Direction_Pin, OUTPUT);
-    digitalWrite(Direction_Pin, LOW); 
+    digitalWrite(Direction_Pin, LOW); // Direction LOW for reverse / backing out
     setSpeed((float)manualTappRPM, spindleRPM, true);
     return;
   }
 
-  switch (tappState) {
-    case TAPP_FWD:
-      pinMode(Direction_Pin, INPUT); 
-      setSpeed((float)manualTappRPM, spindleRPM, true);
-      tappPulseStartCount = totalPulseCount;
-      tappPulseTarget = 10; 
-      tappState = TAPP_WAIT_1;
-      break;
-
-    case TAPP_WAIT_1:
-      setSpeed((float)manualTappRPM, spindleRPM, true);
-      if ((int)(totalPulseCount - tappPulseStartCount) >= tappPulseTarget) {
-        setSpeed(0, spindleRPM, false); 
-        tappState = TAPP_REV_DIR;
-      }
-      break;
-
-    case TAPP_REV_DIR:
-      if (spindleRPM < 5.0) {
-        pinMode(Direction_Pin, OUTPUT);
-        digitalWrite(Direction_Pin, LOW); 
+  // Automatic Tapping Sub-Sequence
+  if (tappState == TAPP_AUTO_RUNNING) {
+    switch (tappSubState) {
+      case SUB_FWD:
+        pinMode(Direction_Pin, INPUT); 
+        setSpeed((float)manualTappRPM, spindleRPM, true);
         tappPulseStartCount = totalPulseCount;
-        tappPulseTarget = 5; 
-        tappState = TAPP_BWD;
-      }
-      break;
+        tappPulseTarget = 10; // 1 rev forward
+        tappSubState = SUB_WAIT_1;
+        break;
 
-    case TAPP_BWD:
-      setSpeed((float)manualTappRPM, spindleRPM, true);
-      if ((int)(totalPulseCount - tappPulseStartCount) >= tappPulseTarget) {
-        setSpeed(0, spindleRPM, false); 
-        tappState = TAPP_WAIT_2;
-      }
-      break;
+      case SUB_WAIT_1:
+        setSpeed((float)manualTappRPM, spindleRPM, true);
+        if ((int)(totalPulseCount - tappPulseStartCount) >= tappPulseTarget) {
+          setSpeed(0, spindleRPM, false); 
+          tappSubState = SUB_REV_DIR;
+        }
+        break;
 
-    case TAPP_WAIT_2:
-      if (spindleRPM < 5.0) {
-        tappStateTimer = millis();
-        tappState = TAPP_OIL;
-      }
-      break;
+      case SUB_REV_DIR:
+        if (spindleRPM < 5.0) {
+          pinMode(Direction_Pin, OUTPUT);
+          digitalWrite(Direction_Pin, LOW); 
+          tappPulseStartCount = totalPulseCount;
+          tappPulseTarget = 5; // 0.5 rev backward
+          tappSubState = SUB_BWD;
+        }
+        break;
 
-    case TAPP_OIL:
-      if (millis() - tappStateTimer <= TAPPING_COOLING_DUR) {
-        digitalWrite(Pump_Pin, HIGH);
-      } else {
-        digitalWrite(Pump_Pin, LOW);
-        tappState = TAPP_FWD; 
-      }
-      break;
+      case SUB_BWD:
+        setSpeed((float)manualTappRPM, spindleRPM, true);
+        if ((int)(totalPulseCount - tappPulseStartCount) >= tappPulseTarget) {
+          setSpeed(0, spindleRPM, false); 
+          tappSubState = SUB_WAIT_2;
+        }
+        break;
 
-    default:
-      break;
+      case SUB_WAIT_2:
+        if (spindleRPM < 5.0) {
+          tappStateTimer = millis();
+          tappSubState = SUB_OIL;
+        }
+        break;
+
+      case SUB_OIL:
+        if (millis() - tappStateTimer <= TAPPING_COOLING_DUR) {
+          digitalWrite(Pump_Pin, HIGH);
+        } else {
+          digitalWrite(Pump_Pin, LOW);
+          tappSubState = SUB_FWD; // Loop back for next cycle
+        }
+        break;
+    }
   }
 }
 
@@ -492,9 +506,12 @@ void updateCooling() {
     return;
   }
 
-  if (currentMode == MODE_TAPP) return;
+  if (currentMode == MODE_TAPP) {
+    // Tapping state machine handles its own oil reservoir pump during SUB_OIL
+    return;
+  }
 
-  if (coolingMode == 0) {
+  if (coolingMode == 0 || calculateTorque() <= 1.0f) {
     digitalWrite(Pump_Pin, LOW);
     pumpActive = false;
     return;
@@ -522,51 +539,77 @@ void updateCooling() {
 }
 
 /* =========================================================================
-   7. DISPLAY & BUTTON UTILITIES
+   7. DISPLAY & BUTTON UTILITIES (Non-Shifting Punctuation/Unit Blinking)
    ========================================================================= */
 void renderDisplayLine1() {
   lcd.setCursor(0, 0);
-  
-  // Mode Prefix
-  if (currentMode == MODE_DRILL) lcd.print(F("D:"));
-  else if (currentMode == MODE_CHAMPFER) lcd.print(F("C:"));
-  else lcd.print(F("T:"));
+  bool blink = (millis() / 300) % 2 == 0; // Blinking toggle every 300ms
 
-  // Hole Size (2 digits)
+  // Mode Prefix
+  if (currentMode == MODE_DRILL) lcd.print(F("D"));
+  else if (currentMode == MODE_CHAMPFER) lcd.print(F("C"));
+  else lcd.print(F("T"));
+
+  // Focus 0: Size -> Blink the colon after mode prefix
+  if (activeFocus == 0 && !blink) {
+    lcd.print(' ');
+  } else {
+    lcd.print(':');
+  }
+
+  // Hole Size value
   int size = (currentMode == MODE_TAPP) ? tappSizes[sizeIndex] : drillSizes[sizeIndex];
   if (size < 10) lcd.print('0');
   lcd.print(size);
   lcd.print(' ');
 
-  // Target RPM
+  // Target RPM value
   int targetRPM = (int)getActiveTargetRPM();
-  lcd.print(F("RPM:"));
+  lcd.print(F("RPM"));
+  
+  // Focus 1: Target RPM -> Blink the colon in "RPM:"
+  if (activeFocus == 1 && !blink) {
+    lcd.print(' ');
+  } else {
+    lcd.print(':');
+  }
   if (targetRPM < 1000) lcd.print(' ');
   lcd.print(targetRPM);
   lcd.print(' ');
 
-  // Cooling Option
-  lcd.print(F("C"));
+  // Focus 2: Cooling -> Blink the letter 'C'
+  if (activeFocus == 2 && !blink) {
+    lcd.print(' ');
+  } else {
+    lcd.print('C');
+  }
   lcd.print(coolingMode);
 }
 
 void renderDisplayLine2() {
   lcd.setCursor(0, 1);
-  
+  bool blink = (millis() / 300) % 2 == 0;
+
   // 1. Left Metric (Voltage, Power, or Measured RPM as U)
   if (line2Metric == 0) {
     lcd.print(systemVoltage, 1);
-    lcd.print(F("V "));
+    // Focus 3: Blink 'V' unit
+    if (activeFocus == 3 && !blink) lcd.print("  ");
+    else lcd.print(F("V "));
   } else if (line2Metric == 1) {
     int pwr = (int)getPower();
     if (pwr < 100) lcd.print(' ');
     lcd.print(pwr);
-    lcd.print(F("W "));
+    // Focus 3: Blink 'W' unit
+    if (activeFocus == 3 && !blink) lcd.print("  ");
+    else lcd.print(F("W "));
   } else {
     int rpmInt = (int)spindleRPM;
     if (rpmInt < 1000) lcd.print(' ');
     lcd.print(rpmInt);
-    lcd.print(F("U "));
+    // Focus 3: Blink 'U' unit
+    if (activeFocus == 3 && !blink) lcd.print("  ");
+    else lcd.print(F("U "));
   }
 
   // 2. Torque (yyNm)
