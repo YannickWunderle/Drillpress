@@ -1,4 +1,4 @@
-#include <hd44780.h>//automatic cooling only humming when tapping (probably too when drilling)
+#include <hd44780.h>
 #include <hd44780ioClass/hd44780_pinIO.h>
 
 #define Temp_Pin A2
@@ -19,7 +19,7 @@
 // =========================================================================
 #define TAPP_STARTUP_GRACE_MS    700   // Startup grace period in ms
 #define TAPP_STARTUP_TORQUE_MULT 4.0f  // Torque multiplier during startup grace period
-#define SHUNT_RESISTANCE_MOHM    4.8f  // <-- Adjust this to match your clamp meter!
+#define SHUNT_RESISTANCE_MOHM    4.8f  // Shunt resistance in milliohms
 
 #if defined (ARDUINO_ARCH_ESP8266)
 const int rs=D8, en=D9, db4=D4, db5=D5, db6=D6, db7=D7;
@@ -54,12 +54,13 @@ int coolingMode = 0; // Default to manual (0)
 #define COOLING_DUR_3 100  // ms
 #define COOLING_DUR_4 200  // ms
 const float coolingScaling[] = {1.0f, 1.3f, 1.7f, 2.2f};
+unsigned long lastPumpOffTime = 0;
 
-// Tapping specific oil dispense durations corresponding to the 4 automatic cooling modes
-const unsigned long tappingCoolingDurations[] = {0, 500, 1000, 200, 300}; // Index matches coolingMode (0-4)
+// Tapping specific oil dispense durations corresponding to the 4 automatic cooling modes (20, 50, 100, 200 ms)
+const unsigned long tappingCoolingDurations[] = {0, 20, 50, 100, 200}; 
 
-// Centralized pump request flag for automated routines
-bool autoPumpActive = false;
+// Centralized pump off target timestamp for non-blocking bursts
+unsigned long pumpOffTime = 0;
 
 // UI Focus: 0 = Size, 1 = Target RPM (or Torque in Tapping), 2 = Cooling Mode, 3 = Line 2 Left Metric
 int activeFocus = 0; 
@@ -75,7 +76,7 @@ bool thermalFault = false;
 enum TappingWorkflowState { TAPP_IDLE, TAPP_RUNNING, TAPP_PAUSED_INSPECT, TAPP_RETRACTING, TAPP_CLASSIC_AUTO };
 TappingWorkflowState tappStateEnum = TAPP_IDLE;
 
-// Internal automatic tapping sub-sequence states (for Classic Periodic & Peck Tapping)
+// Internal automatic tapping sub-sequence states
 enum TappingSubState { SUB_FWD, SUB_TORQUE_REV, SUB_TORQUE_OIL, SUB_CLASSIC_WAIT_1, SUB_CLASSIC_REV_DIR, SUB_CLASSIC_BWD, SUB_CLASSIC_WAIT_2, SUB_CLASSIC_OIL };
 TappingSubState tappSubState = SUB_FWD;
 
@@ -99,9 +100,10 @@ float systemVoltage = 0.0;
 float systemCurrent = 0.0;
 float spindleRPM = 0.0;
 unsigned long totalPulseCount = 0; 
+int zeroCurrentADC = 0;
 
 void setup() {
-  Serial.begin(9600); // Re-enabled for shunt calibration monitoring
+  Serial.begin(9600);
   lcd.begin(LCD_COLS, LCD_ROWS);
   analogReference(INTERNAL); // Set internal 1.1V reference for accurate shunt readings
 
@@ -122,14 +124,20 @@ void setup() {
   digitalWrite(LED_Pin, LOW);
   digitalWrite(Throttle_Pin, LOW);
 
+  // Auto-tare shunt baseline at boot (Motor off = true 0A)
+  long adcSum = 0;
+  for (int i = 0; i < 50; i++) {
+    adcSum += safeAnalogRead(Current_Pin);
+    delay(10);
+  }
+  zeroCurrentADC = adcSum / 50;
+
   manualDrillRPM = constrain((int)calculateOptimalRPM(MODE_DRILL, drillSizes[sizeIndex]), 60, 3000);
   manualChampferRPM = constrain((int)calculateOptimalRPM(MODE_CHAMPFER, drillSizes[sizeIndex]), 60, 3000);
 }
 
 void loop() {
-  autoPumpActive = false;
-
-  // 1. Read Sensors every 500ms with EMA smoothing & Serial Shunt Debugging
+  // 1. Read Sensors every 500ms with EMA smoothing
   static unsigned long lastSensorReadTime = 0;
   if (millis() - lastSensorReadTime >= 500) {
     lastSensorReadTime = millis();
@@ -235,13 +243,23 @@ void loop() {
   }
 
   // =========================================================================
-  // CENTRALIZED PUMP ARBITRATION (Manual Pedal vs Automated Routines)
+  // CENTRALIZED PUMP ARBITRATION (Solid Non-Blocking Burst Control)
   // =========================================================================
   bool pedalPressed = (digitalRead(Pedal_Pin) == LOW);
-  if (pedalPressed || autoPumpActive) {
+  if (pedalPressed || millis() < pumpOffTime) {
     digitalWrite(Pump_Pin, HIGH);
   } else {
     digitalWrite(Pump_Pin, LOW);
+  }
+}
+
+/* =========================================================================
+   HELPER: REQUEST A SOLID PUMP BURST FOR X MILLISECONDS
+   ========================================================================= */
+void requestPumpBurst(unsigned long duration_ms) {
+  unsigned long targetOff = millis() + duration_ms;
+  if (targetOff > pumpOffTime) {
+    pumpOffTime = targetOff;
   }
 }
 
@@ -394,18 +412,16 @@ float readCurrent() {
   static float smoothedCurrent = 0.0;
   int rawADC = safeAnalogRead(Current_Pin);
   
-  // Convert raw ADC to millivolts using the 1.1V internal reference (~1.0752 mV per count)
-  float voltageDrop_mV = (float)rawADC * 1.0752f;
+  int netADC = rawADC - zeroCurrentADC;
+  if (netADC < 0) netADC = 0; 
   
-  // Apply Ohm's Law with the tuned shunt resistance
+  float voltageDrop_mV = (float)netADC * 1.0752f;
   float rawCurrent = voltageDrop_mV / SHUNT_RESISTANCE_MOHM;
+  
+  if (rawCurrent < 0.05f) rawCurrent = 0.0f;
 
-   smoothedCurrent = (0.99 * smoothedCurrent) + (0.01 * rawCurrent);
-
-  // DEBUG PRINT FOR SHUNT CALIBRATION VERIFICATION
-  Serial.print(F("Shunt ADC: ")); Serial.print(rawADC);
-  Serial.print(F(" | mV: ")); Serial.print(voltageDrop_mV, 2);
-  Serial.print(F(" | Calibrated Amps: ")); Serial.println(smoothedCurrent, 2);
+  if (smoothedCurrent == 0.0) smoothedCurrent = rawCurrent;
+  else smoothedCurrent = (0.99 * smoothedCurrent) + (0.01 * rawCurrent);
   
   return smoothedCurrent;
 }
@@ -593,7 +609,7 @@ void runTappingStateMachine() {
 
       case SUB_TORQUE_OIL:
         if (millis() - tappStateTimer <= activeOilDuration) {
-          autoPumpActive = true; 
+          requestPumpBurst(activeOilDuration); // Solid non-blocking burst
         } else {
           tappPassStartTime = millis(); 
           tappSubState = SUB_FWD;
@@ -659,7 +675,7 @@ void runTappingStateMachine() {
       case SUB_CLASSIC_OIL:
         if (coolingMode > 0 && activeOilDuration > 0) {
           if (millis() - tappStateTimer <= activeOilDuration) {
-            autoPumpActive = true; 
+            requestPumpBurst(activeOilDuration); // Solid non-blocking burst
           } else {
             tappPassStartTime = millis(); 
             tappSubState = SUB_FWD; 
@@ -674,16 +690,26 @@ void runTappingStateMachine() {
 }
 
 /* =========================================================================
-   6. COOLING MANAGEMENT SYSTEM
+   6. COOLING MANAGEMENT SYSTEM (Drill / Chamfer Modes)
+   ========================================================================= */
+/* =========================================================================
+   6. COOLING MANAGEMENT SYSTEM (Drill / Chamfer Modes)
    ========================================================================= */
 void updateCooling() {
   if (coolingMode == 0 || calculateTorque() <= 1.0f) {
     return;
   }
 
+  unsigned long currentMillis = millis();
+
+  // Enforce at least a 2-second pause (2000ms) after the last pump burst finished
+  if (currentMillis - lastPumpOffTime < 2000) {
+    return; 
+  }
+
   static unsigned long pumpOnTime = 0;
   static bool pumpActive = false;
-  unsigned long currentMillis = millis();
+  
   float power = getPower();
   unsigned long baseDuration = COOLING_DUR_1;
   if (coolingMode == 2) baseDuration = COOLING_DUR_2;
@@ -699,11 +725,12 @@ void updateCooling() {
   } else {
     if (currentMillis - pumpOnTime >= activeDuration) {
       pumpActive = false;
+      lastPumpOffTime = currentMillis; // Record when this burst ended to start the 2s countdown!
     }
   }
 
   if (pumpActive) {
-    autoPumpActive = true;
+    requestPumpBurst(activeDuration);
   }
 }
 
