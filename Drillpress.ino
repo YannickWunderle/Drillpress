@@ -14,6 +14,12 @@
 #define Voltage_Pin A1
 #define Keypad_Pin A0
 
+// =========================================================================
+// TAPPING CONFIGURABLE CONSTANTS (Easy Tuning)
+// =========================================================================
+#define TAPP_STARTUP_GRACE_MS    700   // Startup grace period in ms
+#define TAPP_STARTUP_TORQUE_MULT 4.0f  // Torque multiplier during startup grace period
+
 #if defined (ARDUINO_ARCH_ESP8266)
 const int rs=D8, en=D9, db4=D4, db5=D5, db6=D6, db7=D7;
 #else
@@ -36,7 +42,7 @@ const int drillSizes[] = {3, 4, 5, 6, 8, 10, 12, 15, 20, 26, 32, 40};
 const int numDrillSizes = 12;
 
 const int tappSizes[] = {3, 4, 5, 6, 8, 10, 12};
-int tappTorqueLimits[] = {3, 3, 5, 7, 10, 15, 20}; // M3 forced to at least 3 Nm for safety
+int tappTorqueLimits[] = {1, 2, 5, 7, 10, 15, 20}; // M3 = 1 Nm, M4 = 2 Nm
 const int numTappSizes = 7;
 int sizeIndex = 3; // Default to 6mm for Drill/Champfer, 8mm for Tapping
 
@@ -62,13 +68,11 @@ int manualChampferRPM = 400;
 // Motor Run State Toggle, Thermal State & Tapping States
 bool motorRunning = false;
 bool thermalFault = false;
-enum TappingWorkflowState { TAPP_IDLE, TAPP_AUTO_RUNNING, TAPP_SINGLE_PASS, TAPP_PAUSED_INSPECT, TAPP_RETRACTING };
+enum TappingWorkflowState { TAPP_IDLE, TAPP_RUNNING, TAPP_PAUSED_INSPECT, TAPP_RETRACTING, TAPP_CLASSIC_AUTO };
 TappingWorkflowState tappStateEnum = TAPP_IDLE;
-enum TappingWorkflowType { WORKFLOW_SINGLE, WORKFLOW_AUTO };
-TappingWorkflowType activeWorkflow = WORKFLOW_SINGLE;
 
-// Internal automatic tapping sub-sequence states
-enum TappingSubState { SUB_FWD, SUB_WAIT_1, SUB_REV_DIR, SUB_BWD, SUB_WAIT_2, SUB_OIL, SUB_TORQUE_RETRACT };
+// Internal automatic tapping sub-sequence states (for Classic Periodic & Peck Tapping)
+enum TappingSubState { SUB_FWD, SUB_TORQUE_REV, SUB_TORQUE_OIL, SUB_CLASSIC_WAIT_1, SUB_CLASSIC_REV_DIR, SUB_CLASSIC_BWD, SUB_CLASSIC_WAIT_2, SUB_CLASSIC_OIL };
 TappingSubState tappSubState = SUB_FWD;
 
 unsigned long tappStateTimer = 0;
@@ -118,6 +122,13 @@ void setup() {
 }
 
 void loop() {
+  // 0. GLOBAL PEDAL OVERRIDE: Pump spins ONLY as long as the pedal is held down (LOW)
+  if (digitalRead(Pedal_Pin) == LOW) {
+    digitalWrite(Pump_Pin, HIGH);
+  } else {
+    digitalWrite(Pump_Pin, LOW);
+  }
+
   // 1. Read Sensors every 500ms with EMA smoothing
   static unsigned long lastSensorReadTime = 0;
   if (millis() - lastSensorReadTime >= 500) {
@@ -144,23 +155,26 @@ void loop() {
   if (btnAction == 1 && !thermalFault) { // Short Press
     if (currentMode == MODE_TAPP) {
       if (tappStateEnum == TAPP_IDLE) {
-        activeWorkflow = WORKFLOW_SINGLE;
-        tappStateEnum = TAPP_SINGLE_PASS;
+        // Start Single-Pass Peck Tapping Forward
+        tappStateEnum = TAPP_RUNNING;
         tappSubState = SUB_FWD;
         tappPassStartTime = millis();
         motorRunning = true;
         digitalWrite(LED_Pin, HIGH);
       } 
-      else if (tappStateEnum == TAPP_SINGLE_PASS || tappStateEnum == TAPP_AUTO_RUNNING) {
+      else if (tappStateEnum == TAPP_RUNNING || tappStateEnum == TAPP_CLASSIC_AUTO) {
+        // Stop / Pause Tapping
         tappStateEnum = TAPP_PAUSED_INSPECT;
         motorRunning = false;
         setSpeed(0, spindleRPM, false);
       } 
       else if (tappStateEnum == TAPP_PAUSED_INSPECT) {
+        // Short Press while paused -> Back out (Retract)
         tappStateEnum = TAPP_RETRACTING;
         motorRunning = true;
       } 
       else if (tappStateEnum == TAPP_RETRACTING) {
+        // Short Press while backing out -> Finish tapping process completely
         tappStateEnum = TAPP_IDLE;
         motorRunning = false;
         digitalWrite(LED_Pin, LOW);
@@ -178,14 +192,15 @@ void loop() {
   else if (btnAction == 2 && !thermalFault) { // Long Press (> 1s)
     if (currentMode == MODE_TAPP) {
       if (tappStateEnum == TAPP_IDLE) {
-        activeWorkflow = WORKFLOW_AUTO;
-        tappStateEnum = TAPP_AUTO_RUNNING;
+        // Start Classic Periodic Tapping (1 rev forward, 0.5 rev back, oil, checking torque)
+        tappStateEnum = TAPP_CLASSIC_AUTO;
         tappSubState = SUB_FWD;
         tappPassStartTime = millis();
         motorRunning = true;
         digitalWrite(LED_Pin, HIGH);
       } else if (tappStateEnum == TAPP_PAUSED_INSPECT) {
-        tappStateEnum = (activeWorkflow == WORKFLOW_SINGLE) ? TAPP_SINGLE_PASS : TAPP_AUTO_RUNNING;
+        // Long Press while paused -> Resume Tapping
+        tappStateEnum = TAPP_RUNNING;
         tappPassStartTime = millis();
         motorRunning = true;
         digitalWrite(LED_Pin, HIGH);
@@ -208,11 +223,13 @@ void loop() {
     }
   }
 
-  // 7. Update Cooling every 100ms
+  // 7. Update Cooling every 100ms (Only runs if pedal is NOT pressed)
   static unsigned long lastCoolingCheck = 0;
   if (millis() - lastCoolingCheck >= 100) {
     lastCoolingCheck = millis();
-    updateCooling();
+    if (digitalRead(Pedal_Pin) != LOW) {
+      updateCooling();
+    }
   }
 
   // 8. Display Rendering (Throttled to 0.5Hz / 500ms)
@@ -310,9 +327,7 @@ void handleKeypadInput(KeyState key) {
       else if (currentMode == MODE_CHAMPFER) manualChampferRPM = constrain((int)calculateOptimalRPM(currentMode, drillSizes[sizeIndex]), 60, 3000);
     } else if (activeFocus == 1) {
       if (currentMode == MODE_TAPP) {
-        // Enforce M3 minimum torque floor of 3 Nm
-        int minLimit = (tappSizes[sizeIndex] == 3) ? 3 : 1;
-        if (tappTorqueLimits[sizeIndex] > minLimit) tappTorqueLimits[sizeIndex]--;
+        if (tappTorqueLimits[sizeIndex] > 1) tappTorqueLimits[sizeIndex]--;
       } else if (currentMode == MODE_DRILL) {
         manualDrillRPM = constrain(manualDrillRPM - 25, 60, 3000);
       } else {
@@ -510,7 +525,7 @@ void setSpeed(float targetRPM, float currentRPM, bool enabled) {
 }
 
 /* =========================================================================
-   5. TAPPING STATE MACHINE
+   5. TAPPING STATE MACHINE (Peck Tapping & Classic Periodic Auto Tapping)
    ========================================================================= */
 void runTappingStateMachine() {
   if (tappStateEnum == TAPP_IDLE || tappStateEnum == TAPP_PAUSED_INSPECT || thermalFault) {
@@ -526,40 +541,64 @@ void runTappingStateMachine() {
     return;
   }
 
-  // 1. Single-Pass Tapping (Short Press Start)
-  if (tappStateEnum == TAPP_SINGLE_PASS) {
-    bool torqueExceeded = (millis() - tappPassStartTime > 400) && (calculateTorque() >= tappTorqueLimits[sizeIndex]);
-    
-    if (torqueExceeded) {
-      setSpeed(0, spindleRPM, false);
-      pinMode(Direction_Pin, OUTPUT);
-      digitalWrite(Direction_Pin, LOW);
-      tappPulseStartCount = totalPulseCount;
-      tappPulseTarget = 5; 
-      while ((int)(totalPulseCount - tappPulseStartCount) < tappPulseTarget) {
-        setSpeed(90.0f, getSpindleRPM(), true);
-      }
-      setSpeed(0, spindleRPM, false);
-      tappStateEnum = TAPP_PAUSED_INSPECT;
-      motorRunning = false;
-      return;
+  // Common torque limit calculator using top defines
+  bool inGrace = (millis() - tappPassStartTime <= TAPP_STARTUP_GRACE_MS);
+  float activeTorqueLimit = inGrace ? (float)(tappTorqueLimits[sizeIndex] * TAPP_STARTUP_TORQUE_MULT) : (float)tappTorqueLimits[sizeIndex];
+  bool torqueExceeded = (!inGrace && calculateTorque() >= activeTorqueLimit);
+
+  // 1. Single-Pass Peck Tapping (Short Press Start)
+  if (tappStateEnum == TAPP_RUNNING) {
+    switch (tappSubState) {
+      case SUB_FWD:
+        if (torqueExceeded) {
+          // Stop, reverse 0.5 revs (5 pulses) to break chip
+          setSpeed(0, spindleRPM, false);
+          pinMode(Direction_Pin, OUTPUT);
+          digitalWrite(Direction_Pin, LOW);
+          tappPulseStartCount = totalPulseCount;
+          tappPulseTarget = 5; 
+          tappSubState = SUB_TORQUE_REV;
+          break;
+        }
+        pinMode(Direction_Pin, INPUT);
+        setSpeed(60.0f, spindleRPM, true);
+        break;
+
+      case SUB_TORQUE_REV:
+        setSpeed(90.0f, spindleRPM, true);
+        if ((int)(totalPulseCount - tappPulseStartCount) >= tappPulseTarget) {
+          setSpeed(0, spindleRPM, false);
+          if (coolingMode > 0) {
+            tappStateTimer = millis();
+            tappSubState = SUB_TORQUE_OIL;
+          } else {
+            tappPassStartTime = millis(); 
+            tappSubState = SUB_FWD;
+          }
+        }
+        break;
+
+      case SUB_TORQUE_OIL:
+        if (millis() - tappStateTimer <= TAPPING_COOLING_DUR) {
+          digitalWrite(Pump_Pin, HIGH);
+        } else {
+          digitalWrite(Pump_Pin, LOW);
+          tappPassStartTime = millis(); 
+          tappSubState = SUB_FWD;
+        }
+        break;
     }
-    pinMode(Direction_Pin, INPUT);
-    setSpeed(60.0f, spindleRPM, true); 
-    return;
   }
 
-  // 2. Periodic Auto Tapping (Long Press Start)
-  if (tappStateEnum == TAPP_AUTO_RUNNING) {
-    bool torqueExceeded = (millis() - tappPassStartTime > 400) && (calculateTorque() >= tappTorqueLimits[sizeIndex]);
-
+  // 2. Classic Periodic Tapping (Long Press Start: 1 rev fwd, 0.5 rev back, oil pulse, repeat + torque check)
+  else if (tappStateEnum == TAPP_CLASSIC_AUTO) {
     if (tappSubState == SUB_FWD && torqueExceeded) {
       setSpeed(0, spindleRPM, false);
       pinMode(Direction_Pin, OUTPUT);
       digitalWrite(Direction_Pin, LOW); 
       tappPulseStartCount = totalPulseCount;
       tappPulseTarget = 5; 
-      tappSubState = SUB_TORQUE_RETRACT;
+      tappSubState = SUB_CLASSIC_REV_DIR;
       return;
     }
 
@@ -568,62 +607,55 @@ void runTappingStateMachine() {
         pinMode(Direction_Pin, INPUT); 
         setSpeed(60.0f, spindleRPM, true); 
         tappPulseStartCount = totalPulseCount;
-        tappPulseTarget = 10; 
-        tappSubState = SUB_WAIT_1;
+        tappPulseTarget = 10; // 1 full revolution forward (10 pulses)
+        tappSubState = SUB_CLASSIC_WAIT_1;
         break;
 
-      case SUB_WAIT_1:
+      case SUB_CLASSIC_WAIT_1:
         setSpeed(60.0f, spindleRPM, true);
         if ((int)(totalPulseCount - tappPulseStartCount) >= tappPulseTarget) {
           setSpeed(0, spindleRPM, false); 
-          tappSubState = SUB_REV_DIR;
+          tappSubState = SUB_CLASSIC_REV_DIR;
         }
         break;
 
-      case SUB_TORQUE_RETRACT:
-        setSpeed(90.0f, spindleRPM, true);
-        if ((int)(totalPulseCount - tappPulseStartCount) >= tappPulseTarget) {
-          setSpeed(0, spindleRPM, false);
-          tappPassStartTime = millis(); 
-          tappSubState = SUB_FWD; 
-        }
-        break;
-
-      case SUB_REV_DIR:
+      case SUB_CLASSIC_REV_DIR:
         if (spindleRPM < 5.0) {
           pinMode(Direction_Pin, OUTPUT);
           digitalWrite(Direction_Pin, LOW); 
           tappPulseStartCount = totalPulseCount;
-          tappPulseTarget = 5; 
-          tappSubState = SUB_BWD;
+          tappPulseTarget = 5; // 0.5 revolution backward (5 pulses)
+          tappSubState = SUB_CLASSIC_BWD;
         }
         break;
 
-      case SUB_BWD:
+      case SUB_CLASSIC_BWD:
         setSpeed(90.0f, spindleRPM, true); 
         if ((int)(totalPulseCount - tappPulseStartCount) >= tappPulseTarget) {
           setSpeed(0, spindleRPM, false); 
-          tappSubState = SUB_WAIT_2;
+          tappSubState = SUB_CLASSIC_WAIT_2;
         }
         break;
 
-      case SUB_WAIT_2:
+      case SUB_CLASSIC_WAIT_2:
         if (spindleRPM < 5.0) {
           tappStateTimer = millis();
-          tappSubState = SUB_OIL;
+          tappSubState = SUB_CLASSIC_OIL;
         }
         break;
 
-      case SUB_OIL:
+      case SUB_CLASSIC_OIL:
         if (coolingMode > 0) {
           if (millis() - tappStateTimer <= TAPPING_COOLING_DUR) {
             digitalWrite(Pump_Pin, HIGH);
           } else {
             digitalWrite(Pump_Pin, LOW);
+            tappPassStartTime = millis(); // Reset startup grace period for next pass
             tappSubState = SUB_FWD; 
           }
         } else {
           digitalWrite(Pump_Pin, LOW);
+          tappPassStartTime = millis(); // Reset startup grace period for next pass
           tappSubState = SUB_FWD;
         }
         break;
@@ -635,24 +667,16 @@ void runTappingStateMachine() {
    6. COOLING MANAGEMENT SYSTEM
    ========================================================================= */
 void updateCooling() {
-  static unsigned long pumpOnTime = 0;
-  static bool pumpActive = false;
-  unsigned long currentMillis = millis();
-
-  if (digitalRead(Pedal_Pin) == LOW) {
-    digitalWrite(Pump_Pin, HIGH);
-    pumpActive = false; 
-    return;
-  }
-
   if (currentMode == MODE_TAPP) return;
 
   if (coolingMode == 0 || calculateTorque() <= 1.0f) {
     digitalWrite(Pump_Pin, LOW);
-    pumpActive = false;
     return;
   }
 
+  static unsigned long pumpOnTime = 0;
+  static bool pumpActive = false;
+  unsigned long currentMillis = millis();
   float power = getPower();
   unsigned long baseDuration = COOLING_DUR_1;
   if (coolingMode == 2) baseDuration = COOLING_DUR_2;
